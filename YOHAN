@@ -1,0 +1,365 @@
+require('dotenv').config();
+const { Client, GatewayIntentBits, Partials, PermissionsBitField } = require('discord.js');
+const fs = require('fs');
+const path = require('path');
+
+const PREFIX = process.env.PREFIX || '.';
+const OWNER_ID = process.env.OWNER_ID || '';
+const TOKEN = process.env.DISCORD_TOKEN;
+if (!TOKEN) {
+  console.error('⚠ DISCORD_TOKEN missing in .env');
+  process.exit(1);
+}
+
+const DATA_PATH = path.join(__dirname, 'data.json');
+let db = {};
+
+// Fonction pour charger la base de données
+function loadDB() {
+  if (!fs.existsSync(DATA_PATH)) {
+    fs.writeFileSync(DATA_PATH, JSON.stringify({
+      blacklist: [],
+      whitelist: [],
+      autoreplies: {},
+      settings: { antispam: false, filterlinks: false, autorespond: false, floodprotect: false },
+      logs: []
+    }, null, 2));
+  }
+  db = JSON.parse(fs.readFileSync(DATA_PATH, 'utf8'));
+}
+
+// Fonction pour sauvegarder la base de données
+function saveDB() {
+  fs.writeFileSync(DATA_PATH, JSON.stringify(db, null, 2));
+}
+
+// Fonction pour journaliser un événement
+function logEvent(evt) {
+  const entry = { ts: new Date().toISOString(), evt };
+  db.logs.unshift(entry);
+  if (db.logs.length > 200) db.logs.pop();
+  saveDB();
+}
+
+// Utilitaire pour détecter les liens
+function isLink(text) {
+  return /(https?:\/\/|www\.)/i.test(text);
+}
+
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent],
+  partials: [Partials.Channel]
+});
+
+loadDB();
+
+client.once('ready', () => {
+  console.log(`✅ Nissi V2 DMF connecté en tant que ${client.user.tag}`);
+});
+
+// Cooldown/protection anti-flood
+const lastMessage = new Map();
+
+client.on('messageCreate', async message => {
+  if (message.author.bot) return;
+
+  // Filtres globaux
+  const s = db.settings;
+  const isWhitelisted = db.whitelist.includes(message.author.id);
+  const isBlacklisted = db.blacklist.includes(message.author.id);
+  
+  if (isBlacklisted) {
+    // Si l'utilisateur est sur la liste noire, ignorer le message (ou prendre une autre mesure si souhaité)
+    return;
+  }
+
+  // Filtrer les liens
+  if (s.filterlinks && isLink(message.content) && !isWhitelisted) {
+    await message.delete().catch(() => {});
+    logEvent(`Lien supprimé de ${message.author.tag} dans #${message.channel.name}`);
+    return;
+  }
+
+  // Protection anti-flood simple
+  if (s.floodprotect && !isWhitelisted) {
+    const key = `${message.guild?.id || 'dm'}:${message.author.id}`;
+    const now = Date.now();
+    const prev = lastMessage.get(key) || 0;
+    if (now - prev < 800) {
+      await message.delete().catch(() => {});
+      logEvent(`Flood supprimé de ${message.author.tag}`);
+      return;
+    }
+    lastMessage.set(key, now);
+  }
+
+  // Réponse automatique
+  if (s.autorespond) {
+    for (const trigger in db.autoreplies) {
+      if (message.content.toLowerCase().includes(trigger.toLowerCase())) {
+        await message.channel.send(db.autoreplies[trigger]).catch(() => {});
+        logEvent(`Auto-réponse "${trigger}" -> "${db.autoreplies[trigger]}" pour ${message.author.tag}`);
+        break;
+      }
+    }
+  }
+
+  // Gestion des commandes
+  if (!message.content.startsWith(PREFIX)) return;
+  const args = message.content.slice(PREFIX.length).trim().split(/\s+/);
+  const cmd = args.shift().toLowerCase();
+  const isOwner = message.author.id === OWNER_ID;
+  const isAdmin = message.member?.permissions.has(PermissionsBitField.Flags.Administrator) || isOwner;
+
+  switch (cmd) {
+    case 'help':
+    case 'menu': {
+      const menu = `🛡 MARTIN FORDING DMF - Menu Commandes Sécurité (1 à 20) 🛡
+.help - Voir ce menu
+.status - Vérifier statut du bot
+.antispam on/off - Activer/Désactiver l’anti-spam
+.block [id] - Bloquer (simulé) un utilisateur
+.unblock [id] - Débloquer (simulé)
+.ban [id] - Signaler (simulé) un utilisateur
+.purge [n] - Supprimer n messages (mod only)
+.scan [msg] - Scanner message suspect (non implémenté)
+.filterlinks on/off - Filtrer liens dangereux
+.log - Journal des menaces (owner only)
+.autorespond on/off - Réponses automatiques
+.setreply [trigger] | [réponse] - Définir réponse auto
+.delreply [trigger] - Supprimer réponse auto
+.listreply - Lister réponses auto
+.floodprotect on/off - Anti-flood
+.whitelist add [id] - Ajouter numéro sûr (discord id)
+.whitelist remove [id] - Retirer whitelist
+.blacklist add [id] - Ajouter blacklist (simulé)
+.blacklist remove [id] - Retirer blacklist
+.shutdown - Éteindre le bot (owner only)
+🔐 Nissi V2 DMF - Sécurité & Contrôle`;
+      message.channel.send(menu);
+      break;
+    }
+
+    case 'status': {
+      const st = db.settings;
+      message.channel.send(`Nissi V2 DMF en ligne.\nSettings: antispam=${st.antispam}, filterlinks=${st.filterlinks}, autorespond=${st.autorespond}, floodprotect=${st.floodprotect}`);
+      break;
+    }
+
+    case 'antispam': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const param = args[0];
+      if (!param || !['on', 'off'].includes(param)) return message.reply('Utilisation : `.antispam on/off`');
+      db.settings.antispam = param === 'on';
+      saveDB();
+      message.reply(`L'anti-spam a été défini sur \`${param}\`.`);
+      logEvent(`antispam ${param} par ${message.author.tag}`);
+      break;
+    }
+
+    case 'filterlinks': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const p = args[0];
+      if (!p || !['on', 'off'].includes(p)) return message.reply('Utilisation : `.filterlinks on/off`');
+      db.settings.filterlinks = p === 'on';
+      saveDB();
+      message.reply(`Le filtrage des liens a été défini sur \`${p}\`.`);
+      logEvent(`filterlinks ${p}`);
+      break;
+    }
+
+    case 'autorespond': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const p = args[0];
+      if (!p || !['on', 'off'].includes(p)) return message.reply('Utilisation : `.autorespond on/off`');
+      db.settings.autorespond = p === 'on';
+      saveDB();
+      message.reply(`L'auto-réponse a été définie sur \`${p}\`.`);
+      logEvent(`autorespond ${p}`);
+      break;
+    }
+
+    case 'setreply': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const raw = message.content.slice((PREFIX + 'setreply').length).trim();
+      const parts = raw.split('|').map(s => s.trim());
+      if (parts.length < 2) return message.reply('Utilisation : `.setreply trigger | réponse`');
+      const trigger = parts[0].toLowerCase();
+      const resp = parts.slice(1).join(' | ');
+      db.autoreplies[trigger] = resp;
+      saveDB();
+      message.reply(`Réponse automatique ajoutée pour : **"${trigger}"**`);
+      logEvent(`setreply "${trigger}" -> "${resp}"`);
+      break;
+    }
+
+    case 'delreply': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const t = args.join(' ').toLowerCase();
+      if (!t) return message.reply('Utilisation : `.delreply trigger`');
+      if (db.autoreplies[t]) {
+        delete db.autoreplies[t];
+        saveDB();
+        message.reply(`Réponse automatique supprimée : **"${t}"**`);
+        logEvent(`delreply "${t}"`);
+      } else message.reply('Trigger non trouvé.');
+      break;
+    }
+
+    case 'listreply': {
+      const keys = Object.keys(db.autoreplies);
+      if (!keys.length) return message.reply('Aucune réponse automatique définie.');
+      const lines = keys.map(k => `• **${k}** => ${db.autoreplies[k]}`).join('\n');
+      message.channel.send(`Réponses automatiques :\n${lines}`);
+      break;
+    }
+
+    case 'block': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const id = args[0];
+      if (!id) return message.reply('Utilisation : `.block [userId]`');
+      if (!db.blacklist.includes(id)) {
+        db.blacklist.push(id);
+        saveDB();
+        message.reply(`ID **${id}** ajouté à la blacklist (simulation).`);
+        logEvent(`blocked (simulé) ${id} par ${message.author.tag}`);
+      } else message.reply('Déjà en blacklist.');
+      break;
+    }
+
+    case 'unblock': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const idu = args[0];
+      if (!idu) return message.reply('Utilisation : `.unblock [userId]`');
+      const idx = db.blacklist.indexOf(idu);
+      if (idx !== -1) {
+        db.blacklist.splice(idx, 1);
+        saveDB();
+        message.reply(`ID **${idu}** retiré de la blacklist.`);
+        logEvent(`unblocked ${idu}`);
+      } else message.reply('ID non trouvé en blacklist.');
+      break;
+    }
+
+    case 'ban': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const idb = args[0];
+      if (!idb) return message.reply('Utilisation : `.ban [userId]` (simulation de signalement)');
+      logEvent(`reported (simulé) ${idb} par ${message.author.tag}`);
+      message.reply(`Signalement simulé pour **${idb}**. (Le bot n'exécute pas de signalement automatique réel.)`);
+      break;
+    }
+
+    case 'purge': {
+      if (!message.member.permissions.has(PermissionsBitField.Flags.ManageMessages)) {
+        return message.reply('Permission requise : `ManageMessages`.');
+      }
+
+      if (!message.guild || !message.channel.isTextBased()) {
+        return message.reply("Cette commande ne peut être utilisée que dans un salon textuel de serveur.");
+      }
+
+      const n = parseInt(args[0]);
+      if (isNaN(n) || n < 1 || n > 100) {
+        return message.reply('Veuillez fournir un nombre valide entre 1 et 100.');
+      }
+
+      try {
+        const fetched = await message.channel.bulkDelete(n, true);
+        const confirmationMsg = await message.channel.send(`Supprimé **${fetched.size}** messages.`);
+        setTimeout(() => confirmationMsg.delete().catch(() => {}), 5000);
+        logEvent(`Purge de ${fetched.size} messages par ${message.author.tag} dans #${message.channel.name}`);
+      } catch (e) {
+        if (e.code === 50034) {
+          const errorMsg = await message.reply("Erreur : Impossible de supprimer les messages datant de plus de 14 jours via la purge en masse.");
+          setTimeout(() => errorMsg.delete().catch(() => {}), 5000);
+        } else {
+          console.error(e);
+          message.reply(`Une erreur est survenue lors de la purge : \`${e.message}\`.`);
+        }
+      }
+      break;
+    }
+
+    case 'floodprotect': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const p = args[0];
+      if (!p || !['on', 'off'].includes(p)) return message.reply('Utilisation : `.floodprotect on/off`');
+      db.settings.floodprotect = p === 'on';
+      saveDB();
+      message.reply(`La protection anti-flood a été définie sur \`${p}\`.`);
+      logEvent(`floodprotect ${p}`);
+      break;
+    }
+
+    case 'whitelist': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const [action, id] = args;
+      if (!['add', 'remove'].includes(action) || !id) return message.reply('Utilisation : `.whitelist add/remove [userId]`');
+      if (action === 'add') {
+        if (!db.whitelist.includes(id)) {
+          db.whitelist.push(id);
+          saveDB();
+          message.reply(`ID **${id}** ajouté à la whitelist.`);
+          logEvent(`whitelist add ${id}`);
+        } else message.reply('ID déjà en whitelist.');
+      } else if (action === 'remove') {
+        const idx = db.whitelist.indexOf(id);
+        if (idx !== -1) {
+          db.whitelist.splice(idx, 1);
+          saveDB();
+          message.reply(`ID **${id}** retiré de la whitelist.`);
+          logEvent(`whitelist remove ${id}`);
+        } else message.reply('ID non trouvé en whitelist.');
+      }
+      break;
+    }
+
+    case 'blacklist': {
+      if (!isAdmin) return message.reply('Permission requise : Administrateur.');
+      const [action, id] = args;
+      if (!['add', 'remove'].includes(action) || !id) return message.reply('Utilisation : `.blacklist add/remove [userId]`');
+      if (action === 'add') {
+        if (!db.blacklist.includes(id)) {
+          db.blacklist.push(id);
+          saveDB();
+          message.reply(`ID **${id}** ajouté à la blacklist (simulation).`);
+          logEvent(`blacklist add (simulé) ${id}`);
+        } else message.reply('ID déjà en blacklist.');
+      } else if (action === 'remove') {
+        const idx = db.blacklist.indexOf(id);
+        if (idx !== -1) {
+          db.blacklist.splice(idx, 1);
+          saveDB();
+          message.reply(`ID **${id}** retiré de la blacklist.`);
+          logEvent(`blacklist remove ${id}`);
+        } else message.reply('ID non trouvé en blacklist.');
+      }
+      break;
+    }
+
+    case 'log': {
+      if (!isOwner) return message.reply('Seul le propriétaire peut utiliser cette commande.');
+      if (!db.logs.length) return message.reply('Aucun événement enregistré.');
+      const logsText = db.logs.map(log => `[${log.ts}] ${log.evt}`).join('\n');
+      message.channel.send(`Journal des événements :\n\`\`\`${logsText}\`\`\``);
+      break;
+    }
+
+    case 'shutdown': {
+      if (!isOwner) return message.reply('Seul le propriétaire peut éteindre le bot.');
+      message.reply('Extinction en cours...').then(() => {
+        client.destroy();
+        process.exit();
+      });
+      break;
+    }
+
+    default:
+      // Réponse par défaut
+      // message.reply(`Commande \`${cmd}\` non reconnue. Tapez \`.help\` pour la liste des commandes.`);
+      break;
+  }
+});
+
+client.login(TOKEN);
